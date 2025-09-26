@@ -29,6 +29,74 @@ function ymdPK(d = new Date()) {
   const pk = new Date(d.getTime() + PK_OFFSET_MS);
   return pk.toISOString().slice(0, 10); // YYYY-MM-DD
 }
+// ───────────────────────────────────────────────────────────────
+// FCM helpers
+// ───────────────────────────────────────────────────────────────
+async function getFcmTokensForUser(uid) {
+  const userDoc = await db.collection("users").doc(uid).get();
+  const tokens = (userDoc.get("deviceToken") || []).filter(Boolean);
+  return { tokens, userRef: userDoc.ref };
+}
+
+async function pruneBadTokens(userRef, tokens, responses) {
+  const toRemove = [];
+  responses.forEach((res, i) => {
+    if (!res || res.success) return;
+    const code = res.error?.code || "";
+    // Typical invalidation errors
+    if (
+      code.includes("messaging/invalid-registration-token") ||
+      code.includes("messaging/registration-token-not-registered")
+    ) {
+      toRemove.push(tokens[i]);
+    }
+  });
+  if (toRemove.length) {
+    await userRef.update({
+      fcmTokens: admin.firestore.FieldValue.arrayRemove(...toRemove),
+    });
+  }
+}
+
+async function sendEarningsNotification(uid, type, amount, meta = {}) {
+  // type ∈ {"dailyRoi","teamProfit"}
+  const { tokens, userRef } = await getFcmTokensForUser(uid);
+  if (!tokens.length) return;
+
+  const title =
+    type === "dailyRoi" ? "Daily ROI credited" : "Team Profit credited";
+  const body =
+    type === "dailyRoi"
+      ? `You received $${Number(amount).toFixed(2)} ROI today.`
+      : `You received $${Number(amount).toFixed(2)} team profit today.`;
+
+  const message = {
+    tokens,
+    notification: { title, body },
+    data: {
+      type,
+      amount: String(amount || 0),
+      ...(meta?.address ? { address: meta.address } : {}),
+      ...(meta?.dateKey ? { dateKey: meta.dateKey } : {}),
+      ...(meta?.txId ? { txId: meta.txId } : {}),
+
+      // Add any navigation hints your apps use:
+      screen: type === "dailyRoi" ? "WalletScreen" : "TeamScreen",
+    },
+    android: {
+      priority: "high",
+      notification: { channelId: "earnings", sound: "default" },
+    },
+    apns: {
+      payload: {
+        aps: { sound: "default", category: "EARNINGS" },
+      },
+    },
+  };
+
+  const resp = await admin.messaging().sendEachForMulticast(message);
+  await pruneBadTokens(userRef, tokens, resp.responses);
+}
 
 /* ───────────────────────────────────────────────────────────────
    Utils
@@ -88,10 +156,16 @@ async function runTxn(fn, max = 8) {
  *   - One roiLog per user/day prevents double-credit for the user on same day.
  *   - Additionally, we create roiPlanLogs per plan/day (for analytics); we DO NOT read them.
  */
+/**
+ * ROI credit (with FCM notification; core logic unchanged)
+ */
 async function creditRoiForUser(userDoc) {
   const uid = userDoc.get("uid");
   const status = (userDoc.get("status") || "").toLowerCase();
   const dateKey = ymdPK();
+
+  // ✨ capture result for post-tx FCM
+  let _roiResult = { credited: false, amount: 0, txId: null, dateKey };
 
   logger.info(`▶ [ROI] user=${uid} enter status=${status}`);
   if (!uid) {
@@ -214,8 +288,7 @@ async function creditRoiForUser(userDoc) {
       credited++;
 
       logger.info(
-        `  ✅ [ROI] user=${uid} plan=${planId} +${roiAmount} → totalAccumulated=${newAccum}${expire ? " (EXPIRE)" : ""
-        }`
+        `  ✅ [ROI] user=${uid} plan=${planId} +${roiAmount} → totalAccumulated=${newAccum}${expire ? " (EXPIRE)" : ""}`
       );
       if (expire) expiredNow++;
     }
@@ -274,16 +347,14 @@ async function creditRoiForUser(userDoc) {
     // ---- WRITES (NO MORE READS) --------------------------------------------
     const nowTs = Timestamp.now();
 
-    // 1) Update account (replace dailyProfit, increment others, set lastRoiDate=today)
-   // 1) Update account (ROI → earnings only; DO NOT touch investment balances)
-tx.update(acctRef, {
-  "earnings.dailyProfit": totalRoiToday,                 // replace (today's ROI total)
-  "earnings.lastRoiDate": dateKey,                       // keep last ROI day
-  "earnings.totalEarned": FieldValue.increment(totalRoiToday),
-  "earnings.totalRoi": FieldValue.increment(totalRoiToday),
-  "earnings.totalEarnedToDate": FieldValue.increment(totalRoiToday), // NEW field
-});
-
+    // 1) Update account (ROI → earnings only; DO NOT touch investment balances)
+    tx.update(acctRef, {
+      "earnings.dailyProfit": totalRoiToday,                 // replace (today's ROI total)
+      "earnings.lastRoiDate": dateKey,                       // keep last ROI day
+      "earnings.totalEarned": FieldValue.increment(totalRoiToday),
+      "earnings.totalRoi": FieldValue.increment(totalRoiToday),
+      "earnings.totalEarnedToDate": FieldValue.increment(totalRoiToday), // NEW field
+    });
 
     // 2) Update each plan and create per-plan daily logs for credited plans
     for (const { ref, roiAmount, newAccum, expire, expireOnly } of planUpdates) {
@@ -332,45 +403,59 @@ tx.update(acctRef, {
     // 4) Idempotency log (per user/day)
     tx.set(roiLogRef, { userId: uid, date: dateKey, creditedAt: nowTs });
 
-    // 5) Possibly deactivate user now if no active plans remain after our updates
+    // 5) Possibly deactivate user now if no active plans remain
     if (!anyActiveAfter) {
       tx.update(userDoc.ref, { status: "inactive" });
       logger.info(`📉 [ROI] user=${uid} deactivated (no active plans remain)`);
     }
+
+    // ✨ set result for FCM (inside the same successful commit path)
+    _roiResult.credited = true;
+    _roiResult.amount = totalRoiToday;
+    _roiResult.txId = roiTxnRef.id;
   });
+
+  // ✨ After txn committed: send FCM only if we actually credited (>0)
+  if (_roiResult.credited && _roiResult.amount > 0) {
+    try {
+      await sendEarningsNotification(uid, "dailyRoi", _roiResult.amount, {
+        dateKey,
+        txId: _roiResult.txId,
+        address: "Daily ROI (all active plans)",
+      });
+    } catch (e) {
+      logger.warn(`🔔 [ROI] FCM send failed uid=${uid} err=${e.message}`);
+    }
+  }
 
   logger.info(`◀ [ROI] user=${uid} done`);
 }
 
-/* ───────────────────────────────────────────────────────────────
-   Phase B — Team Profit (per user)
-   ─────────────────────────────────────────────────────────────── */
-/**
- * Idempotency:
- *   One teamLog per user/day prevents double-credit of team profit the same day.
- * Computation:
- *   Build levels outside tx. Sum downlines' accounts.earnings.dailyProfit **only if**
- *   accounts.earnings.lastRoiDate === today (prevents stale carry-over).
- * Credits:
- *   - Increment account teamProfit/totalEarned/currentBalance/remainingBalance
- *   - Add totalTeamProfit to totalAccumulated of each active plan; expire when >= cap
- *   - One transaction record of type "teamProfit"
- */
 // ───────────────────────────────────────────────────────────────
-// Phase B — Team Profit (per user)  [UPDATED]
-// Enforces: L1 always open; L2–L5 need ≥1 qualifying member at that depth with ≥$50 invested
+// Phase B — Team Profit (MXG, L1-controlled with $50 qualifier)
+// L1 always open. For L>=2, unlock if count(qualifying L1 directs) >= requiredMembers.
+// Qualifying L1 direct: status=='active' AND isBlocked!=true AND
+//                       has ANY ACTIVE plan with principal >= MIN_INVEST_USD (single plan).
+// Profit base per depth = today's ROI only (lastRoiDate===today).
+// Accounting: earnings.* only (incl. totalEarnedToDate); do NOT touch investment.*
+// Ignore levels beyond L5.
 // ───────────────────────────────────────────────────────────────
-const MIN_INVEST_USD = 50; // per slide
+const MIN_INVEST_USD = 50;
 
 async function creditTeamForUser(userDoc) {
   const uid = userDoc.get("uid");
   const status = (userDoc.get("status") || "").toLowerCase();
+  const isBlocked = userDoc.get("isBlocked") === true;
   const dateKey = ymdPK();
 
-  logger.info(`▶ [TEAM] user=${uid} enter status=${status}`);
+  // ✨ capture result for post-tx FCM (no core logic changes)
+  let _teamResult = { credited: false, amount: 0, txId: null, dateKey };
+  let _txAddressForNotif = null;
+
+  logger.info(`▶ [TEAM] (L1+$50 gate) user=${uid} status=${status}`);
   if (!uid) return;
-  if (status !== "active") {
-    logger.debug(`⏭ [TEAM] skip user=${uid} (not active)`);
+  if (status !== "active" || isBlocked) {
+    logger.debug(`⏭ [TEAM] user=${uid} not eligible (inactive/blocked)`);
     return;
   }
 
@@ -381,38 +466,95 @@ async function creditTeamForUser(userDoc) {
     return;
   }
 
-  // Load team settings (ordered by level). Expect fields:
-  //  - level (1..N)
-  //  - profitPercentage (e.g., 10,7,4,3,3)
+  // Load team settings (ordered, capped to 5 levels)
   const settingsSnap = await db.collection("teamSettings").orderBy("level").get();
-  const settings = settingsSnap.docs.map((d) => d.data());
-  logger.info(`ℹ️ [TEAM] user=${uid} levels=${settings.length}`);
+  let settings = settingsSnap.docs.map((d) => d.data());
+  settings = settings
+    .map((s) => ({
+      level: Number(s.level),
+      profitPercentage: Number(s.profitPercentage || 0),
+      requiredMembers:
+        s.requiredMembers !== undefined && s.requiredMembers !== null
+          ? Number(s.requiredMembers)
+          : Math.max(0, Number(s.level) - 1), // default L2:1, L3:2, ...
+    }))
+    .filter((s) => s.level >= 1 && s.level <= 5)
+    .sort((a, b) => a.level - b.level);
 
-  // BFS over the referral tree. Children are users whose referralCode == parent uid.
+  if (!settings.length) {
+    logger.warn(`⛔ [TEAM] user=${uid} teamSettings empty`);
+    return;
+  }
+
+  // BFS frontier always contains ACTIVE & not-blocked user ids of the previous depth.
   let frontier = [uid];
+
+  // L1 stats
+  let l1ActiveUids = [];
+  let level1QualifyingCount = 0;
 
   let totalTeamProfit = 0;
   const levelSummaries = [];
 
   for (const cfg of settings) {
-    const level = Number(cfg.level);
-    const pct = Number(cfg.profitPercentage || 0);
+    const level = cfg.level;
+    const pct = cfg.profitPercentage;
+    const req = cfg.requiredMembers;
 
-    logger.debug(`• [TEAM] user=${uid} L${level} frontier=${frontier.length} pct=${pct}`);
+    logger.debug(`• [TEAM] L${level} frontier=${frontier.length} req=${req} pct=${pct}`);
 
-    // 1) Gather ACTIVE users at this depth
+    // 1) Gather ACTIVE & not-blocked children at this depth
     const childDocs = [];
     for (const parentChunk of chunk(frontier, 10)) {
+      if (!parentChunk.length) continue;
       const q = await db
         .collection("users")
         .where("referralCode", "in", parentChunk)
         .where("status", "==", "active")
         .get();
-      childDocs.push(...q.docs);
+      q.docs.forEach((d) => {
+        if (d.get("isBlocked") === true) return; // exclude blocked
+        childDocs.push(d);
+      });
     }
     const childUids = childDocs.map((d) => d.get("uid")).filter(Boolean);
 
-    // 2) Sum today's ROI at this depth (only if lastRoiDate === today)
+    // 2) On L1, compute qualifying directs (single plan >= $50, ACTIVE)
+    if (level === 1) {
+      l1ActiveUids = childUids.slice();
+
+      if (l1ActiveUids.length) {
+        let qualifying = 0;
+
+        for (const uidChunk of chunk(l1ActiveUids, 10)) {
+          const plansSnap = await db
+            .collection("userPlans")
+            .where("userId", "in", uidChunk)
+            .where("status", "==", "active")
+            .get();
+
+          // Mark users that have at least one ACTIVE plan with principal >= $50
+          const qualified = new Set();
+          plansSnap.forEach((p) => {
+            const u = String(p.get("userId") || "");
+            if (!u || qualified.has(u)) return;
+            const principal = Number(p.get("principal") || 0);
+            if (principal >= MIN_INVEST_USD) qualified.add(u);
+          });
+
+          qualifying += uidChunk.filter((u) => qualified.has(u)).length;
+        }
+
+        level1QualifyingCount = qualifying;
+      }
+
+      logger.info(
+        `📌 [TEAM] user=${uid} L1 active=${l1ActiveUids.length}, ` +
+          `qualifying(≥$${MIN_INVEST_USD})=${level1QualifyingCount}`
+      );
+    }
+
+    // 3) Profit base at this depth from today's ROI only
     let levelDailyProfit = 0;
     if (childUids.length) {
       for (const uidChunk of chunk(childUids, 10)) {
@@ -426,37 +568,10 @@ async function creditTeamForUser(userDoc) {
       }
     }
 
-    // 3) Unlock rule per slide:
-    //    - L1: always open
-    //    - L>=2: unlocked if there exists ≥1 ACTIVE user at THIS depth
-    //            with an ACTIVE plan whose invested amount ≥ $50
-    let unlocked = (level === 1);
-    let hasDepthQualifier = false;
+    // 4) Unlock decision
+    const unlocked = level === 1 ? true : level1QualifyingCount >= req;
 
-    if (level > 1 && childUids.length) {
-      for (const uidChunk of chunk(childUids, 10)) {
-        const plansSnap = await db
-          .collection("userPlans")
-          .where("userId", "in", uidChunk)
-          .where("status", "==", "active")
-          .get();
-
-        plansSnap.forEach((p) => {
-          // Be tolerant of schema differences:
-          const invested =
-            Number(p.get("investedAmount")) ||
-            Number(p.get("amount")) ||
-            Number(p.get("principal")) ||
-            Number(p.get("buyAmount")) ||
-            0;
-          if (invested >= MIN_INVEST_USD) hasDepthQualifier = true;
-        });
-
-        if (hasDepthQualifier) break;
-      }
-      unlocked = hasDepthQualifier;
-    }
-
+    // 5) Share and accumulate
     const share = unlocked ? (levelDailyProfit * pct) / 100 : 0;
     totalTeamProfit += share;
 
@@ -464,31 +579,36 @@ async function creditTeamForUser(userDoc) {
       level,
       depthActive: childUids.length,
       levelDailyProfit,
-      unlockedBy: level === 1 ? "L1AlwaysOpen" : `HasDepthMember≥$${MIN_INVEST_USD}`,
       pct,
       share,
-      qualified: (level === 1) ? true : hasDepthQualifier,
+      unlockedBy: "L1QualifyingDirects(≥ $" + MIN_INVEST_USD + ")",
+      l1Active: l1ActiveUids.length,
+      l1Qualifying: level1QualifyingCount,
+      req,
     });
 
     logger.info(
       `  Σ [TEAM] user=${uid} L${level} active=${childUids.length} ` +
-      `profitBase=${levelDailyProfit} unlocked=${unlocked} share=${share}`
+        `base=${levelDailyProfit} unlocked(${level1QualifyingCount} ≥ ${req})=${unlocked} share=${share}`
     );
 
-    // 4) Advance BFS frontier to go one level deeper
+    // Advance to next depth
     frontier = childUids;
   }
 
   logger.info(
-    `Σ [TEAM] user=${uid} totalTeamProfit=${totalTeamProfit}; ` +
-    `detail=${JSON.stringify(levelSummaries)}`
+    `Σ [TEAM] user=${uid} totalTeamProfit=${totalTeamProfit}; detail=${JSON.stringify(
+      levelSummaries
+    )}`
   );
+
+  // If nothing to credit today, exit without creating a transaction (per your rule)
   if (totalTeamProfit <= 0) {
     logger.debug(`⏭ [TEAM] user=${uid} nothing to credit`);
     return;
   }
 
-  // Load account & active plans (outside tx)
+  // Load this user's account + active plans (outside tx)
   const acctSnap = await db.collection("accounts").where("userId", "==", uid).limit(1).get();
   if (acctSnap.empty) {
     logger.warn(`⛔ [TEAM] user=${uid} account not found`);
@@ -506,7 +626,7 @@ async function creditTeamForUser(userDoc) {
   const planRefs = activePlansSnap.docs.map((d) => d.ref);
 
   await runTxn(async (tx) => {
-    // READS FIRST
+    // READS
     const [acctTxnSnap, teamLogSnap] = await Promise.all([tx.get(acctRef), tx.get(teamLogRef)]);
     if (teamLogSnap.exists) {
       logger.debug(`🔁 [TEAM] user=${uid} log appeared during txn; skip credit`);
@@ -516,7 +636,7 @@ async function creditTeamForUser(userDoc) {
     const planTxnSnaps = [];
     for (const pRef of planRefs) planTxnSnaps.push(await tx.get(pRef));
 
-    // Build updates for each active plan of THIS user
+    // Build plan updates for THIS user's active plans
     const planUpdates = []; // { ref, newAccum, expire, expireOnly }
     let bumped = 0;
     let expiredNow = 0;
@@ -541,25 +661,27 @@ async function creditTeamForUser(userDoc) {
       if (expire) expiredNow++;
     }
 
-    // Determine if any plan remains active after updates
+    // Any plan remains active after updates?
     let anyActiveAfter = false;
     for (const pSnap of planTxnSnaps) {
       if ((pSnap.get("status") || "") !== "active") continue;
       const upd = planUpdates.find((u) => u.ref.path === pSnap.ref.path);
-      if (!upd || !upd.expire) { anyActiveAfter = true; break; }
+      if (!upd || !upd.expire) {
+        anyActiveAfter = true;
+        break;
+      }
     }
 
     // WRITES
     const nowTs = Timestamp.now();
 
-    // 1) Account earnings increments only (NO touch of dailyProfit or investment balances)
+    // Earnings only (do not touch dailyProfit or investments)
     tx.update(acctRef, {
       "earnings.teamProfit": FieldValue.increment(totalTeamProfit),
       "earnings.totalEarned": FieldValue.increment(totalTeamProfit),
       "earnings.totalEarnedToDate": FieldValue.increment(totalTeamProfit),
     });
 
-    // 2) Plans bump/expire
     for (const { ref, newAccum, expire, expireOnly } of planUpdates) {
       if (expireOnly) {
         tx.update(ref, { status: "expired", lastCollectedDate: nowTs });
@@ -572,14 +694,13 @@ async function creditTeamForUser(userDoc) {
       }
     }
 
-    // Levels that produced > 0 share today
+    // Only create a transaction when >0 total (we're in that branch)
     const contributingLevels = levelSummaries
       .filter((l) => (l.share || 0) > 0)
       .map((l) => l.level);
     const levelLabel = compactLevelRanges(contributingLevels);
     const txAddress = levelLabel ? `Lv ${levelLabel}` : "Lv —";
 
-    // 3) Transaction record
     tx.set(teamTxnRef, {
       transactionId: teamTxnRef.id,
       userId: uid,
@@ -590,23 +711,49 @@ async function creditTeamForUser(userDoc) {
       balanceUpdated: true,
       timestamp: nowTs,
       meta: {
-        unlockRule: `L1AlwaysOpen, L>=2 requires ≥1 depth member with ≥$${MIN_INVEST_USD}`,
+        unlockRule: `L1 qualifying directs (active & not blocked & ≥$${MIN_INVEST_USD}); L1 always open`,
+        l1Active: l1ActiveUids.length,
+        l1Qualifying: level1QualifyingCount,
+        requiredMembersByLevel: settings.map((s) => ({
+          level: s.level,
+          req: s.requiredMembers,
+        })),
         contributingLevels,
         detail: levelSummaries,
       },
     });
 
-    // 4) Idempotency stamp
+    // Idempotency stamp
     tx.set(teamLogRef, { userId: uid, date: dateKey, creditedAt: nowTs });
 
-    // 5) Possibly deactivate user
+    // Possibly deactivate user if no active plans remain
     if (!anyActiveAfter) tx.update(userDoc.ref, { status: "inactive" });
+
+    // ✨ capture results for FCM (no core logic changes)
+    _teamResult.credited = true;
+    _teamResult.amount = totalTeamProfit;
+    _teamResult.txId = teamTxnRef.id;
+    _txAddressForNotif = txAddress;
 
     logger.debug(`  ✔ [TEAM] user=${uid} plansBumped=${bumped}, expiredNow=${expiredNow}`);
   });
 
+  // ✨ After txn committed: send FCM only if we actually credited (>0)
+  if (_teamResult.credited && _teamResult.amount > 0) {
+    try {
+      await sendEarningsNotification(uid, "teamProfit", _teamResult.amount, {
+        dateKey,
+        txId: _teamResult.txId,
+        address: _txAddressForNotif || "Lv —",
+      });
+    } catch (e) {
+      logger.warn(`🔔 [TEAM] FCM send failed uid=${uid} err=${e.message}`);
+    }
+  }
+
   logger.info(`◀ [TEAM] user=${uid} done`);
 }
+
 
 
 /* ───────────────────────────────────────────────────────────────
