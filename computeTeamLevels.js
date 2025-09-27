@@ -7,6 +7,10 @@
  * - Daily base uses TODAY's ROI only: earnings.lastRoiDate === dateKey
  * - Business source: investment.totalInvestedInPlans
  * - Returns: level stats + full user list per level (rich fields)
+ *
+ * NEW:
+ * - users[*].activeInvested: sum of principal over ACTIVE plans for that user (USD)
+ * - levels[*].levelActiveInvestedTotal: sum of activeInvested across active & not-blocked users at that level (USD)
  */
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { logger } = require("firebase-functions");
@@ -128,6 +132,32 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
         }
       }
 
+      // 🔹 NEW: Per-user ACTIVE invested principal (sum of plan.principal where status=="active")
+      // Map: uid -> sum of active principals (USD)
+      const activeInvestedByUid = new Map();
+      let levelActiveInvestedTotal = 0; // per-level aggregate
+      if (activeCleanUids.length) {
+        for (const uChunk of chunk10(activeCleanUids)) {
+          const plansSnap = await db
+            .collection("userPlans")
+            .where("userId", "in", uChunk)
+            .where("status", "==", "active")
+            .get();
+          plansSnap.forEach((p) => {
+            const u = String(p.get("userId") || "");
+            if (!u) return;
+            const principal = Number(p.get("principal") || 0);
+            const prev = activeInvestedByUid.get(u) || 0;
+            const next = prev + principal;
+            activeInvestedByUid.set(u, next);
+          });
+        }
+        // per-level sum across active & not-blocked users at this depth
+        for (const u of activeCleanUids) {
+          levelActiveInvestedTotal += Number(activeInvestedByUid.get(u) || 0);
+        }
+      }
+
       // Compute level aggregates (ACTIVE & not blocked only)
       let levelDeposit = 0;
       let levelDailyProfitToday = 0;
@@ -177,6 +207,7 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
       const usersEnriched = usersBasic.map((u) => {
         const acc = perUserAcc.get(u.uid) || {};
         const todayRoi = (acc.lastRoiDate || "") === dateKey ? Number(acc.dailyProfit || 0) : 0;
+        const activeInvested = Number(activeInvestedByUid.get(u.uid) || 0); // NEW
         return {
           uid: u.uid,
           firstName: u.firstName,
@@ -187,6 +218,7 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
           dailyProfit: Number(acc.dailyProfit || 0),
           lastRoiDate: acc.lastRoiDate || "",
           todayRoi, // ROI counted today only
+          activeInvested, // NEW: sum(principal) of ACTIVE plans (USD)
           ...(levelNum === 1
             ? { qualifies: u.status === "active" && !u.isBlocked && l1QualifiesSet.has(u.uid) }
             : {}),
@@ -203,7 +235,8 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
         inactiveUsers: usersBasic.length - activeCleanUids.length,
         totalDeposit: levelDeposit,
         levelDailyProfitToday,
-        users: usersEnriched, // ← full list for this level (as requested)
+        levelActiveInvestedTotal, // NEW per-level aggregate (USD)
+        users: usersEnriched, // full list for this level
       });
 
       // Advance BFS only via ACTIVE & not blocked users
@@ -227,7 +260,8 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
 
     // Self deposit — from totalInvestedInPlans
     let selfDeposit = 0;
-    const selfAccSnap = await db.collection("accounts")
+    const selfAccSnap = await db
+      .collection("accounts")
       .where("userId", "==", rootUid)
       .limit(1)
       .get();
@@ -248,14 +282,14 @@ exports.computeTeamLevelsAndCreditProfit = onCall(
     );
 
     return {
-      levels,                    // includes users per level
-      profitBooked: false,       // UI-only
-      creditedAmount: 0,         // UI-only
+      levels, // includes users per level (now with activeInvested) + levelActiveInvestedTotal
+      profitBooked: false, // UI-only
+      creditedAmount: 0, // UI-only
       directBusiness,
       selfDeposit,
-      l1QualifyingCount,         // for badges/locks
-      requiredMembersByLevel,    // show rules
-      dateKey,                   // clarify which "today" the ROI check used
+      l1QualifyingCount, // for badges/locks
+      requiredMembersByLevel, // show rules
+      dateKey, // clarify which "today" the ROI check used
     };
   }
 );

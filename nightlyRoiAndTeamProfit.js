@@ -32,43 +32,48 @@ function ymdPK(d = new Date()) {
 // ───────────────────────────────────────────────────────────────
 // FCM helpers
 // ───────────────────────────────────────────────────────────────
-async function getFcmTokensForUser(uid) {
-  const userDoc = await db.collection("users").doc(uid).get();
-  const tokens = (userDoc.get("deviceToken") || []).filter(Boolean);
+// Replace any previous token lookup with this:
+async function getFcmTokensForUid(uid) {
+  // Find the users doc whose *field* uid == <uid>
+  const q = await db.collection("users").where("uid", "==", uid).limit(1).get();
+  if (q.empty) {
+    logger.warn(`🔕 No users doc with field uid='${uid}'`);
+    return { tokens: [], userRef: null };
+  }
+  const userDoc = q.docs[0];
+  const token = (userDoc.get("deviceToken") || "").trim();
+  const tokens = token ? [token] : [];
+  if (!tokens.length) logger.warn(`🔕 users/${userDoc.id} has empty deviceToken (uid='${uid}')`);
   return { tokens, userRef: userDoc.ref };
 }
 
+
 async function pruneBadTokens(userRef, tokens, responses) {
-  const toRemove = [];
-  responses.forEach((res, i) => {
+  let shouldClear = false;
+  responses.forEach((res) => {
     if (!res || res.success) return;
     const code = res.error?.code || "";
-    // Typical invalidation errors
     if (
       code.includes("messaging/invalid-registration-token") ||
       code.includes("messaging/registration-token-not-registered")
     ) {
-      toRemove.push(tokens[i]);
+      shouldClear = true;
     }
   });
-  if (toRemove.length) {
-    await userRef.update({
-      fcmTokens: admin.firestore.FieldValue.arrayRemove(...toRemove),
-    });
+  if (shouldClear) {
+    await userRef.update({ deviceToken: FieldValue.delete() }); // or set: ""
+    logger.info(`🧹 Cleared invalid deviceToken for ${userRef.path}`);
   }
 }
 
 async function sendEarningsNotification(uid, type, amount, meta = {}) {
-  // type ∈ {"dailyRoi","teamProfit"}
-  const { tokens, userRef } = await getFcmTokensForUser(uid);
+  const { tokens, userRef } = await getFcmTokensForUid(uid);
   if (!tokens.length) return;
 
-  const title =
-    type === "dailyRoi" ? "Daily ROI credited" : "Team Profit credited";
-  const body =
-    type === "dailyRoi"
-      ? `You received $${Number(amount).toFixed(2)} ROI today.`
-      : `You received $${Number(amount).toFixed(2)} team profit today.`;
+  const title = type === "dailyRoi" ? "Daily ROI credited" : "Team Profit credited";
+  const body  = type === "dailyRoi"
+    ? `You received $${Number(amount).toFixed(2)} ROI today.`
+    : `You received $${Number(amount).toFixed(2)} team profit today.`;
 
   const message = {
     tokens,
@@ -79,24 +84,71 @@ async function sendEarningsNotification(uid, type, amount, meta = {}) {
       ...(meta?.address ? { address: meta.address } : {}),
       ...(meta?.dateKey ? { dateKey: meta.dateKey } : {}),
       ...(meta?.txId ? { txId: meta.txId } : {}),
-
-      // Add any navigation hints your apps use:
       screen: type === "dailyRoi" ? "WalletScreen" : "TeamScreen",
     },
-    android: {
-      priority: "high",
-      notification: { channelId: "earnings", sound: "default" },
-    },
-    apns: {
-      payload: {
-        aps: { sound: "default", category: "EARNINGS" },
-      },
-    },
+    android: { priority: "high", notification: { channelId: "earnings", sound: "default" } },
+    apns: { payload: { aps: { sound: "default", category: "EARNINGS" } } },
   };
 
   const resp = await admin.messaging().sendEachForMulticast(message);
+  logger.info(`FCM → uid=${uid} type=${type} success=${resp.successCount} failure=${resp.failureCount}`);
   await pruneBadTokens(userRef, tokens, resp.responses);
 }
+// === NEW: plan-expiry push (idempotent per plan+day) =========================
+async function notifyPlanExpiries(uid, planIds, extra = {}) {
+  if (!Array.isArray(planIds) || planIds.length === 0) return;
+
+  const dateKey = ymdPK();
+  const newlyNotified = [];
+
+  // Try to create a per-plan-per-day notif log; if it already exists, skip
+  await Promise.all(
+    planIds.map(async (planId) => {
+      const ref = db.collection("planExpiryNotifyLogs").doc(`${uid}_${planId}_${dateKey}`);
+      try {
+        await ref.create({
+          userId: uid,
+          planId,
+          date: dateKey,
+          notifiedAt: Timestamp.now(),
+        }); // throws if already exists
+        newlyNotified.push(planId);
+      } catch (e) {
+        // ALREADY_EXISTS = 6 in Firestore gRPC codes; skip silently
+        if (e?.code !== 6) logger.warn(`planExpiryNotifyLogs create failed uid=${uid} plan=${planId} err=${e.message}`);
+      }
+    })
+  );
+
+  if (!newlyNotified.length) return;
+
+  const { tokens, userRef } = await getFcmTokensForUid(uid);
+  if (!tokens.length) return;
+
+  const title = newlyNotified.length === 1 ? "Plan expired" : "Multiple plans expired";
+  const body =
+    newlyNotified.length === 1
+      ? "One of your investment plans has just expired."
+      : `${newlyNotified.length} of your investment plans have just expired.`;
+
+  const message = {
+    tokens,
+    notification: { title, body },
+    data: {
+      type: "planExpired",
+      dateKey,
+      planIds: newlyNotified.join(","), // comma-separated for client
+      ...(extra?.source ? { source: extra.source } : {}),
+    },
+    android: { priority: "high", notification: { channelId: "earnings", sound: "default" } },
+    apns: { payload: { aps: { sound: "default", category: "EARNINGS" } } },
+  };
+
+  const resp = await admin.messaging().sendEachForMulticast(message);
+  logger.info(`FCM → uid=${uid} type=planExpired success=${resp.successCount} failure=${resp.failureCount} plans=${newlyNotified.length}`);
+  await pruneBadTokens(userRef, tokens, resp.responses);
+}
+
 
 /* ───────────────────────────────────────────────────────────────
    Utils
@@ -208,6 +260,7 @@ async function creditRoiForUser(userDoc) {
   // Prepare refs to read inside transaction
   const planRefs = plansSnap.docs.map((d) => d.ref);
 
+  const _expiredPlanIds = [];
   await runTxn(async (tx) => {
     // ---- READS FIRST --------------------------------------------------------
     const [acctTxnSnap, roiLogSnap] = await Promise.all([tx.get(acctRef), tx.get(roiLogRef)]);
@@ -262,6 +315,7 @@ async function creditRoiForUser(userDoc) {
       if (currentAccum >= cap) {
         planUpdates.push({ ref: pSnap.ref, roiAmount: 0, expire: true, expireOnly: true });
         expiredNow++;
+        _expiredPlanIds.push(pSnap.ref.id);
         logger.info(
           `  ⏹ [ROI] user=${uid} plan=${planId} already >= cap (${currentAccum}/${cap}) → EXPIRE (no ROI credit)`
         );
@@ -283,6 +337,7 @@ async function creditRoiForUser(userDoc) {
         expire,
         expireOnly: false,
       });
+      if (expire) _expiredPlanIds.push(pSnap.ref.id);
       totalRoiToday += roiAmount;
       anyPlanUpdated = true;
       credited++;
@@ -427,7 +482,14 @@ async function creditRoiForUser(userDoc) {
       logger.warn(`🔔 [ROI] FCM send failed uid=${uid} err=${e.message}`);
     }
   }
-
+try {
+    if (_expiredPlanIds.length) {
+      // de-dup just in case
+      await notifyPlanExpiries(uid, Array.from(new Set(_expiredPlanIds)), { source: "ROI" });
+    }
+  } catch (e) {
+    logger.warn(`plan-expiry notify (ROI) failed uid=${uid} err=${e.message}`);
+ }
   logger.info(`◀ [ROI] user=${uid} done`);
 }
 
@@ -625,6 +687,7 @@ async function creditTeamForUser(userDoc) {
   const teamTxnRef = db.collection("transactions").doc();
   const planRefs = activePlansSnap.docs.map((d) => d.ref);
 
+  const _expiredPlanIds = [];
   await runTxn(async (tx) => {
     // READS
     const [acctTxnSnap, teamLogSnap] = await Promise.all([tx.get(acctRef), tx.get(teamLogRef)]);
@@ -650,6 +713,7 @@ async function creditTeamForUser(userDoc) {
       if (currentAccum >= cap) {
         planUpdates.push({ ref: pSnap.ref, expire: true, expireOnly: true });
         expiredNow++;
+        _expiredPlanIds.push(pSnap.ref.id);
         continue;
       }
 
@@ -658,7 +722,7 @@ async function creditTeamForUser(userDoc) {
 
       planUpdates.push({ ref: pSnap.ref, newAccum, expire, expireOnly: false });
       bumped++;
-      if (expire) expiredNow++;
+     if (expire) { expiredNow++; _expiredPlanIds.push(pSnap.ref.id); } 
     }
 
     // Any plan remains active after updates?
@@ -752,7 +816,15 @@ async function creditTeamForUser(userDoc) {
       logger.warn(`🔔 [TEAM] FCM send failed uid=${uid} err=${e.message}`);
     }
   }
-
+ // ✨ After txn: notify plan expiries (idempotent per plan+day)
+  try {
+    if (_expiredPlanIds.length) {
+      const unique = Array.from(new Set(_expiredPlanIds));
+      await notifyPlanExpiries(uid, unique, { source: "TEAM" });
+    }
+  } catch (e) {
+   logger.warn(`plan-expiry notify (TEAM) failed uid=${uid} err=${e.message}`);
+  }
   logger.info(`◀ [TEAM] user=${uid} done`);
 }
 
