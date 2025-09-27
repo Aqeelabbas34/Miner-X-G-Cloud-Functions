@@ -680,6 +680,8 @@ async function creditTeamForUser(userDoc) {
       "earnings.teamProfit": FieldValue.increment(totalTeamProfit),
       "earnings.totalEarned": FieldValue.increment(totalTeamProfit),
       "earnings.totalEarnedToDate": FieldValue.increment(totalTeamProfit),
+      "earnings.teamDaily": totalTeamProfit,
+      "earnings.lastTeamDate": dateKey,
     });
 
     for (const { ref, newAccum, expire, expireOnly } of planUpdates) {
