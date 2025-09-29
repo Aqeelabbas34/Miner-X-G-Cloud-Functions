@@ -4,9 +4,14 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { logger } = require("firebase-functions");
 const admin = require("firebase-admin");
-const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+
 
 if (admin.apps.length === 0) admin.initializeApp();
+
+const { getMessaging } = require("firebase-admin/messaging");
+const messaging = getMessaging();
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+
 const db = getFirestore();
 
 /** Ranks in strict order (sequential-claiming enforced) */
@@ -21,7 +26,7 @@ const RANKS = [
   { id: "LEGEND",   title: "Legend",   direct:500000,   indirect: 2000000,   reward: 150000 },
 ];
 
-const MIN_SELF_INVEST_USD = 50; // user must have ≥ $50 invested in at least one ACTIVE self plan
+const MIN_SELF_INVEST_USD = 10; // user must have ≥ $10 invested in at least one ACTIVE self plan
 
 function chunk10(arr) {
   const out = [];
@@ -29,6 +34,65 @@ function chunk10(arr) {
   return out;
 }
 
+
+/** Read device tokens from a user doc (supports `deviceToken` or `fcmToken`; string or array). */
+function extractTokensFromUserSnap(userSnap) {
+  const raw1 = userSnap.get("deviceToken");
+  const raw2 = userSnap.get("fcmToken");
+  const toArr = (v) =>
+    Array.isArray(v) ? v
+    : (typeof v === "string" && v.trim() ? [v.trim()] : []);
+  // de-dup + drop empties
+  return [...new Set([...toArr(raw1), ...toArr(raw2)].filter(Boolean))];
+}
+
+/** Resolve a user doc for a given uid (docId == uid, otherwise where uid == ...) */
+async function resolveUserDoc(uid) {
+  const byId = await db.collection("users").doc(uid).get();
+  if (byId.exists) return byId;
+  const q = await db.collection("users").where("uid", "==", uid).limit(1).get();
+  if (!q.empty) return q.docs[0];
+  throw new HttpsError("not-found", "User not found.");
+}
+
+/** Get all device tokens for a uid. */
+async function getDeviceTokensForUid(uid) {
+  const snap = await resolveUserDoc(uid);
+  return extractTokensFromUserSnap(snap);
+}
+
+/**
+ * Send an FCM to all devices for a user.
+ * Usage:
+ *    await sendFcmToUid(uid, {
+ *      notification: { title: "Hi", body: "Message" },
+ *      data: { type: "rank-claim", rankId: "GOLD" } // strings only
+ *    });
+ */
+async function sendFcmToUid(uid, payload) {
+  const tokens = await getDeviceTokensForUid(uid);
+  if (!tokens.length) {
+    logger.warn(`[FCM] No tokens for uid=${uid}`);
+    return { successCount: 0, failureCount: 0 };
+  }
+
+  const res = await messaging.sendEachForMulticast({
+    tokens,
+    notification: payload.notification ?? undefined,
+    data: payload.data ?? undefined,
+    android: payload.android ?? undefined,
+    apns: payload.apns ?? undefined,
+  });
+
+  logger.info(`[FCM] uid=${uid} tokens=${tokens.length} success=${res.successCount} failure=${res.failureCount}`);
+
+  // Optional: log invalid tokens (you can also delete them here if you store arrays)
+  res.responses.forEach((r, i) => {
+    if (!r.success) logger.warn(`[FCM] token[${i}] failed: ${r.error?.code} ${r.error?.message}`);
+  });
+
+  return res;
+}
 /* ───────────────────────────────────────────────────────────────
    Helpers
    ─ Counts should ignore user/account status (as requested)
@@ -146,18 +210,18 @@ function readPlanInvested(pSnap) {
   ) || 0;
 }
 
-async function resolveUserDoc(uid) {
-  // Try docId == uid first
-  const dirRef = db.collection("users").doc(uid);
-  const dirSnap = await dirRef.get();
-  if (dirSnap.exists) return dirSnap;
+// async function resolveUserDoc(uid) {
+//   // Try docId == uid first
+//   const dirRef = db.collection("users").doc(uid);
+//   const dirSnap = await dirRef.get();
+//   if (dirSnap.exists) return dirSnap;
 
-  // Fallback: where uid == ...
-  const q = await db.collection("users").where("uid", "==", uid).limit(1).get();
-  if (!q.empty) return q.docs[0];
+//   // Fallback: where uid == ...
+//   const q = await db.collection("users").where("uid", "==", uid).limit(1).get();
+//   if (!q.empty) return q.docs[0];
 
-  throw new HttpsError("not-found", "User not found.");
-}
+//   throw new HttpsError("not-found", "User not found.");
+// }
 
 /* ───────────────────────────────────────────────────────────────
    Public callable (read-only)
@@ -392,6 +456,24 @@ exports.claimRank = onCall(
     const claimedIds = claimedSnaps.docs.map(d => d.get("rankId"));
 
     logger.info(`[Claim OK] uid=${uid} rank=${rankId} (reward=${rank.reward})`);
+    // 🔔 Send FCM (non-blocking for UX; wrap in try/catch)
+try {
+  await sendFcmToUid(uid, {
+    notification: {
+      title: `🎉 ${rank.title} rank claimed!`,
+      body:  `You received $${rank.reward} for ${rank.title}.`
+    },
+    data: {
+      type: "rank-claim",
+      rankId,
+      reward: String(rank.reward),
+      directAtClaim: String(directBusiness),
+      indirectAtClaim: String(indirectBusiness),
+    }
+  });
+} catch (e) {
+  logger.warn(`[FCM] Failed to notify uid=${uid} after claim`, e);
+}
     return { ok: true, claimedIds, directBusiness, indirectBusiness };
   }
 );
