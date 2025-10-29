@@ -100,6 +100,11 @@ async function sendFcmToUid(uid, payload) {
    ─ Accounts: random docId, field userId == uid
    ─ Business source: investment.totalInvestedInPlans (with safe fallbacks)
 ─────────────────────────────────────────────────────────────── */
+function isActiveNotBlocked(userSnap) {
+  const status = String(userSnap.get("status") || "").toLowerCase();
+  const blocked = Boolean(userSnap.get("blocked") || userSnap.get("isBlocked"));
+  return status === "active" && !blocked;
+}
 
 function readLifetimeInvested(accSnap) {
   const inv = accSnap.get("investment") || {};
@@ -118,28 +123,19 @@ async function sumDepositsForUids(uids) {
   for (const uChunk of chunk10(uids)) {
     if (!uChunk.length) continue;
 
-    // Primary: accounts with random docId but userId == uid
+    // Team Levels behavior: only accounts with userId == uid
     const q = await db.collection("accounts")
       .where("userId", "in", uChunk)
       .get();
 
-    const seen = new Set();
     q.forEach(d => {
       total += readLifetimeInvested(d);
-      seen.add(d.get("userId") || d.id);
     });
-
-    // Fallback: accounts/{uid} exists (future-proof)
-    const missing = uChunk.filter(uid => !seen.has(uid));
-    if (missing.length) {
-      const refs = missing.map(uid => db.collection("accounts").doc(uid));
-      const snaps = await db.getAll(...refs);
-      for (const s of snaps) if (s.exists) total += readLifetimeInvested(s);
-    }
   }
 
   return total;
 }
+
 
 /**
  * Fetch immediate children for a frontier of parent UIDs.
@@ -147,30 +143,27 @@ async function sumDepositsForUids(uids) {
  * We also try `referredBy` for extra robustness if present.
  */
 async function findChildrenUids(frontierUids) {
-  const collected = new Map();
+  const collected = [];
 
   for (const parentChunk of chunk10(frontierUids)) {
     if (!parentChunk.length) continue;
 
-    // Main (your schema): child.referralCode == parentUid
+    // Team Levels behavior: only referralCode
     const byReferralCode = await db.collection("users")
       .where("referralCode", "in", parentChunk)
       .get();
-    byReferralCode.docs.forEach(d => collected.set(d.id, d));
 
-    // Extra tolerant (if some docs used 'referredBy')
-    const byReferredBy = await db.collection("users")
-      .where("referredBy", "in", parentChunk)
-      .get();
-    byReferredBy.docs.forEach(d => collected.set(d.id, d));
+    // Keep only active & not-blocked, and map to uid (or doc id fallback)
+    byReferralCode.docs.forEach(d => {
+      if (isActiveNotBlocked(d)) {
+        const uid = d.get("uid") || d.id;
+        if (uid) collected.push(uid);
+      }
+    });
   }
 
-  // Prefer explicit 'uid' field; fallback to doc id
-  const uids = Array.from(collected.values())
-    .map(d => d.get("uid") || d.id)
-    .filter(Boolean);
-
-  return uids;
+  // De-dup in case of overlaps across chunks
+  return [...new Set(collected)];
 }
 
 /**
@@ -178,8 +171,8 @@ async function findChildrenUids(frontierUids) {
  * - No status filter (active/inactive both)
  * - Depth 1 → direct; Depth >=2 → indirect
  */
-async function computeBusinessAll(rootUid, maxDepth = 15) {
-  const MAX = Math.min(Number(maxDepth ?? 15), 15);
+async function computeBusinessAll(rootUid, maxDepth = 5) {
+  const MAX = Math.min(Number(maxDepth ?? 5), 5);
   let frontier = [rootUid];
 
   let directBusiness = 0;
@@ -231,7 +224,7 @@ exports.computeRanksBusiness = onCall(
   async (req) => {
     const rootUid = req.data && req.data.userId;
     if (!rootUid) throw new HttpsError("invalid-argument", "userId is required");
-    const maxDepth = req.data?.maxDepth ?? 15;
+    const maxDepth = req.data?.maxDepth ?? 5;
 
     const { directBusiness, indirectBusiness } = await computeBusinessAll(rootUid, maxDepth);
     logger.info(
@@ -283,7 +276,7 @@ exports.claimRank = onCall(
     if (!rank) throw new HttpsError("invalid-argument", "Unknown rankId");
 
     // Recompute business (server-truth)
-    const { directBusiness, indirectBusiness } = await computeBusinessAll(uid, 15);
+    const { directBusiness, indirectBusiness } = await computeBusinessAll(uid, 5);
     logger.info(`[Claim] uid=${uid} rank=${rankId} direct=${directBusiness} indirect=${indirectBusiness}`);
 
     // Threshold check
